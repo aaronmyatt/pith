@@ -1,5 +1,5 @@
 """Headless regression tests for pith nav: / live narrow + h/l drill & walk."""
-import asyncio, os, sys, tempfile
+import asyncio, json, os, sys, tempfile
 from pathlib import Path
 
 sys.path.insert(0, "/Users/oya/Development/pith")
@@ -49,6 +49,20 @@ async def main():
         root = Path(td)
         (root / "a.py").write_text(A)
         (root / "b.py").write_text(B)
+        # user-command config: global registers t (+ a reserved key, skipped);
+        # the project file overrides t's description
+        (root / "pith").mkdir()
+        (root / "pith" / "config.json").write_text(json.dumps({"commands": {
+            "t": {"run": "sink.sh", "desc": "global sink"},
+            "h": "never.sh"}}))
+        (root / ".pith.json").write_text(json.dumps({"commands": {
+            "t": {"run": "sink.sh", "desc": "project sink"}}}))
+        (root / "sink.sh").write_text(
+            '#!/bin/sh\n'
+            'printf \'%s\\n\' "$PITH_REL:$PITH_LINE-$PITH_END_LINE" "$PITH_KIND"'
+            ' "$PITH_SYMBOL" "$PITH_TARGET" "$#" > "$PITH_ROOT/cmd_out.txt"\n'
+            'cat > "$PITH_ROOT/stdin_copy.txt"\n')
+        (root / "sink.sh").chmod(0o755)
         app = PithApp(root, start_file="a.py")
         async with app.run_test() as pilot:
             for _ in range(300):
@@ -157,16 +171,19 @@ async def main():
             await pilot.press("l")          # follow the call -> b.py
             await pilot.pause()
             assert app.current.path == "b.py", app.current.path
-            await pilot.press("h")          # walk back up the navtree (one press)
+            await pilot.press("h")          # collapse-first: shrink the expanded landing def
+            await pilot.pause()
+            assert app.current.path == "b.py" and not t.cursor_node.is_expanded,                 "h collapses the expanded selection before popping the navtree"
+            await pilot.press("h")          # now walk back up the navtree
             await pilot.pause()
             assert app.current.path == "a.py", "h pops back to previous file"
 
-            # h at the top of a file pops the navtree even when the def is expanded
+            # collapse-first also applies to an expanded def at the top of a file
             cur = t.cursor_node
             assert cur.data.get("kind") == "def" and cur.data.get("name") == "render"                 and cur.is_expanded, cur.data
             await pilot.press("h")
             await pilot.pause()
-            assert app.current.path == "a.py", "empty navtree keeps us here"
+            assert app.current.path == "a.py" and not t.cursor_node.is_expanded,                 "h collapses the top-level def instead of leaving the file"
 
             # h walks up the visual tree inside a file (mid-file nodes)
             await pilot.press("z")          # collapse all so j/k walk top level
@@ -208,7 +225,9 @@ async def main():
             await pilot.press("l")          # follow import -> b.py
             await pilot.pause()
             assert app.current.path == "b.py", app.current.path
-            await pilot.press("h")
+            await pilot.press("h")          # collapse the expanded landing def
+            await pilot.pause()
+            await pilot.press("h")          # then pop the navtree
             await pilot.pause()
             assert app.current.path == "a.py", "h walks back up again"
 
@@ -226,7 +245,8 @@ async def main():
             assert cur.data.get("kind") == "ref", "enter on an expanded def drills again (same as l)"
             await pilot.press("enter"); await pilot.pause()   # on the ref -> follow to b.py
             assert app.current.path == "b.py", "enter on a ref follows like l"
-            await pilot.press("h"); await pilot.pause()
+            await pilot.press("h"); await pilot.pause()       # collapse the expanded landing def
+            await pilot.press("h"); await pilot.pause()       # then pop the navtree
             assert app.current.path == "a.py", "h back after enter-follow"
 
             # ---- 3. bookmarks, repo symbols, breadcrumb, highlight ---------
@@ -269,7 +289,8 @@ async def main():
             await pilot.press("p", "a", "r", "s", "e"); await pilot.pause()
             await pilot.press("enter"); await pilot.pause()
             assert app.current.path == "b.py", app.current.path
-            await pilot.press("h"); await pilot.pause()
+            await pilot.press("h"); await pilot.pause()       # collapse the expanded landing def
+            await pilot.press("h"); await pilot.pause()       # then pop the navtree
             assert app.current.path == "a.py", "h back after symbol jump"
 
             # highlight: narrowed search underlines the matched substring
@@ -279,6 +300,54 @@ async def main():
             assert any("underline" in str(sp.style) for sp in cur.label.spans if sp.style),                 "needle is underlined in the visible label"
             await pilot.press("escape"); await pilot.pause()
             assert app.needle == ""
+
+            # ---- 4. backspace = h; double-press at the root opens the picker
+            app.history.clear()                      # simulate being at the navtree root
+            await pilot.press("z"); await pilot.pause()
+            await pilot.press("k", "k", "k", "k"); await pilot.pause()  # cursor to a top-level row
+            await pilot.press("backspace"); await pilot.pause()
+            assert app._root_confirm and not isinstance(app.screen, PickScreen),                 "first press at the root only arms the confirmation"
+            await pilot.press("j"); await pilot.pause()
+            assert not app._root_confirm, "any other key disarms the confirmation"
+            await pilot.press("h"); await pilot.pause()      # re-arm (h and backspace interchangeable)
+            await pilot.press("backspace"); await pilot.pause()
+            assert isinstance(app.screen, PickScreen),                 "second consecutive press opens the fuzzy file search"
+            await pilot.press("escape"); await pilot.pause()
+
+            # ---- 5. user-configured commands ------------------------------
+            assert "t" in app.user_cmds and app.user_cmds["t"].desc == "project sink",                 "project config overrides global"
+            assert "h" not in app.user_cmds, "reserved keys are skipped"
+            # cursor is on def render (collapsed) after section 4
+            cur = t.cursor_node
+            assert cur.data.get("kind") == "def" and cur.data.get("name") == "render", cur.data
+            out, stdin_copy = root / "cmd_out.txt", root / "stdin_copy.txt"
+
+            async def run_cmd():
+                for p in (out, stdin_copy):
+                    p.unlink(missing_ok=True)
+                await pilot.press("t")
+                for _ in range(100):             # background worker: poll for the files
+                    if out.exists() and stdin_copy.exists():
+                        break
+                    await pilot.pause(0.05)
+                assert out.exists(), "user command ran"
+                return out.read_text().splitlines()
+
+            got = await run_cmd()
+            assert got[0] == "a.py:3-5", got[0]                    # def block bounds
+            assert got[1] == "def", got[1]
+            assert "render" in got[2] and "def render(theme):" in got[2]                 and "Render the scene." in got[2], got[2]           # symbol + doc line
+            assert got[3] == "", "a def has no resolve target"
+            assert got[4] == "0", "no positional args — env vars only"
+            assert stdin_copy.read_text() == "\n".join(A.splitlines()[2:5]),                 "def snippet is piped to stdin"
+
+            # on a ref node the command also gets the resolved target
+            await pilot.press("l"); await pilot.pause()   # expand render, descend to ref
+            assert t.cursor_node.data.get("kind") == "ref", t.cursor_node.data
+            got = await run_cmd()
+            assert got[0] == "a.py:5-5" and got[1] == "ref", got[:2]
+            assert got[3] == "b.py:1", "PITH_TARGET carries the resolved definition"
+            assert stdin_copy.read_text() == A.splitlines()[4],                 "ref snippet is its single source line"
 
             print("ALL TESTS PASSED")
 

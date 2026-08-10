@@ -60,10 +60,10 @@ skeleton:
 | --- | --- |
 | `j` / `k`, arrows | move |
 | `l` | drill down: expand a definition, descend into its calls, follow a call/import into the next file |
-| `h` | walk back up: collapse a def, move to its parent, pop back to the previous file |
+| `h` / `backspace` | walk back up: collapse a def, move to its parent, pop back to the previous file; at the root, press twice to reopen the fuzzy file search |
 | `enter` / click | drill down (same as `l`): expand + descend into calls, follow a call/import |
 | `e` (or `ctrl+enter`) | open current item in `$EDITOR` at its line |
-| `b` / `backspace` | back to previous file |
+| `b` | back to previous file |
 | `f` | file picker |
 | `/` | search: narrow the current screen as you type (see below) |
 | `m` / `M` | bookmark current line (toggle) / list & jump to bookmarks |
@@ -97,6 +97,49 @@ survive restarts.
 
 `g` jumps to any definition in the whole repo — the project symbol table is
 built at startup, so type a symbol name and land on its `file:line` directly.
+
+## Custom commands
+
+Register your own keys in `~/.config/pith/config.json` (global) and/or
+`<repo>/.pith.json` (project — overrides global key-by-key):
+
+```json
+{
+  "commands": {
+    "y":      {"run": "scripts/yank.sh", "desc": "yank snippet"},
+    "ctrl+t": {"run": "~/bin/ticket.sh", "desc": "file ticket", "suspend": true},
+    "Y":      "scripts/quick.sh"
+  }
+}
+```
+
+The script runs with cwd = repo root, no positional args — the selection is
+described entirely in env vars, with the snippet piped to stdin:
+
+| env var | contents |
+| --- | --- |
+| `PITH_ROOT` | absolute repo root (== the cwd) |
+| `PITH_FILE` / `PITH_REL` | absolute / repo-relative path of the current file |
+| `PITH_LINE` / `PITH_END_LINE` | selection bounds — a def's whole block, otherwise one line |
+| `PITH_KIND` | `def` / `ref` / `doc` / `plain` |
+| `PITH_SYMBOL` | symbol context: ancestor chain + the source line + first doc line |
+| `PITH_TARGET` | `path:line` a call/import resolves to (refs only, else empty) |
+| stdin | the snippet (`PITH_LINE`..`PITH_END_LINE`) |
+
+Background commands report `exit code · last output line` in the status bar
+and time out after 60s (`"timeout": N` to change). `"suspend": true` drops out
+of the TUI so the script can be interactive (pager, fzf, lazygit…) — stdin
+stays the terminal there, so the snippet arrives in `PITH_SNIPPET` instead.
+Keys that would shadow a built-in are skipped with a warning. Registered keys
+show in the footer and run against whatever the cursor is on.
+
+Example — copy a snippet to the clipboard (`"y": "scripts/yank.sh"`):
+
+```bash
+#!/bin/sh
+# stdin carries the snippet; pbcopy on macOS, xclip/wl-copy elsewhere
+pbcopy && echo "yanked $PITH_REL:$PITH_LINE"
+```
 
 ## Orientation & legibility
 

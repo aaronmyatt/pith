@@ -7,8 +7,9 @@ startup picks the file with fzf first (instant) so the slower Textual boot
 lands straight in the file; otherwise pith's built-in picker opens.
 
 Navigation is vim-flavoured: `l` drills down (expand a definition, descend into
-its calls, or follow a call/import into another file), `h` walks back up
-(collapse, move to parent, or pop back to the previous file). `/` starts an
+its calls, or follow a call/import into another file), `h` or backspace walks
+back up (collapse, move to parent, or pop back to the previous file; at the
+very root, a second press reopens the fuzzy file search). `/` starts an
 incremental search that narrows the current screen to anything visible on it —
 definitions, calls, imports, doc lines — and the narrow follows you as you
 drill across files.
@@ -25,7 +26,7 @@ import sys
 from pathlib import Path
 
 from rich.text import Text
-from textual import work
+from textual import events, work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Vertical
@@ -33,6 +34,7 @@ from textual.screen import ModalScreen
 from textual.widgets import Footer, Input, LoadingIndicator, OptionList, Static, Tree
 from textual.widgets.option_list import Option
 
+from .config import UserCommand, load_user_commands
 from .indexer import Definition, FileView, Indexer, Location
 
 KIND_ICON = {
@@ -178,10 +180,11 @@ class HelpScreen(ModalScreen):
 
   j / k, ↑ / ↓      move
   l                 drill down: expand a definition · descend into its calls
-  h                 walk up: collapse · move to parent · back a file
+  h / backspace     walk up: collapse · move to parent · back a file
+                    (at the root, press twice for the fuzzy file search)
   enter / click     drill down (same as l): expand · descend · follow call
   e  or  ctrl+enter open current item in $EDITOR at its line
-  b / backspace     back to previous file
+  b                 back to previous file
   f                 file picker
   /                 search: narrow the current screen as you type
                     (defs, calls, imports, doc lines — whatever is visible)
@@ -191,6 +194,10 @@ class HelpScreen(ModalScreen):
   x / z             expand all / collapse all
   r                 re-parse current file
   ?                 this help · q quit
+
+  custom keys       register scripts in ~/.config/pith/config.json or
+                    <repo>/.pith.json — selection arrives in PITH_* env vars,
+                    snippet on stdin
 
   [yellow]★[/yellow]         bookmarked line · [cyan]A › b[/cyan]   current location
   [green]→ name  path:line[/green]   call that resolves to a project definition
@@ -216,8 +223,8 @@ class PithApp(App):
         Binding("m", "mark", show=False),
         Binding("M", "marks", show=False),
         Binding("l", "drill", "drill"),
-        Binding("h", "walk_up", "up"),
-        Binding("b,backspace", "back", "back"),
+        Binding("h,backspace", "walk_up", "up"),
+        Binding("b", "back", "back"),
         Binding("e,o,ctrl+enter", "open_editor", "editor"),
         Binding("escape", "clear_search", "clear", show=False),
         Binding("x", "expand_all", "expand", show=False),
@@ -246,6 +253,8 @@ class PithApp(App):
         self._search_prev: str = ""    # needle before the current search started
         self.bookmarks: dict[str, dict] = {}  # "path:line" -> {path, line, label}
         self._status_extra: str = ""   # last transient status text
+        self._root_confirm: bool = False  # armed by h/backspace at the root; next press opens the picker
+        self.user_cmds: dict[str, UserCommand] = {}  # key -> configured shell command
         self._load_bookmarks()
 
     # -- layout -------------------------------------------------------------
@@ -263,7 +272,22 @@ class PithApp(App):
         tree.show_root = False
         tree.guide_depth = 5
         tree.display = False
+        self._register_user_commands()
         self._index_repo()
+
+    def _register_user_commands(self) -> None:
+        """Bind keys from the global/project config files to their scripts."""
+        reserved = {k for b in self.BINDINGS for k in b.key.split(",")}
+        reserved |= {"enter", "space", "up", "down", "left", "right", "tab"}  # tree/nav keys
+        self.user_cmds, warnings = load_user_commands(self.indexer.root, reserved)
+        for key, cmd in self.user_cmds.items():
+            # Runtime (per-instance) key binding — the footer picks these up.
+            # Ref: https://textual.textualize.io/api/app/#textual.app.App.bind
+            self.bind(key, f"user_cmd('{key}')", description=cmd.desc)
+        for w in warnings:
+            # Toast so config mistakes are visible without fighting the status bar.
+            # Ref: https://textual.textualize.io/api/app/#textual.app.App.notify
+            self.notify(w, title="pith config", severity="warning")
 
     @work(thread=True, exclusive=True)
     def _index_repo(self) -> None:
@@ -437,7 +461,8 @@ class PithApp(App):
                 label = Text("★ ", style="yellow") + label
             text = f"{d.name} {d.signature}"
             node = parent.add(self._highlight_matches(label), expand=narrowed,
-                              data={"kind": "def", "line": d.line, "name": d.name, "text": text})
+                              data={"kind": "def", "line": d.line, "end_line": d.end_line,
+                                    "name": d.name, "text": text})
             kept = False
             if d.docstring:
                 lines = d.docstring.splitlines()
@@ -751,24 +776,47 @@ class PithApp(App):
             self._drill_node(node)
 
     def action_walk_up(self) -> None:
-        """h — walk back up: collapse a def, move to its parent, or pop the navtree."""
+        """h / backspace — walk back up: collapse, move to parent, or pop the navtree."""
         tree = self.query_one(Tree)
         node = tree.cursor_node
         if node is None:
             return
         if node.is_root:
-            self.action_back()
+            self._walk_back_file()
+            return
+        # an expanded selection always collapses first, wherever it sits
+        if node.children and node.is_expanded:
+            self._root_confirm = False
+            node.collapse()
             return
         parent = node.parent
         if parent is not None and not parent.is_root:
-            if node.children and node.is_expanded:
-                node.collapse()
-            else:
-                tree.move_cursor(parent)
-                tree.scroll_to_node(parent)
+            self._root_confirm = False
+            tree.move_cursor(parent)
+            tree.scroll_to_node(parent)
         else:
-            # at the top of the file: walk back up the navtree (previous file)
+            # collapsed at the top of the file: walk back up the navtree
+            self._walk_back_file()
+
+    def _walk_back_file(self) -> None:
+        """Pop the navtree; at the very root, require a second press to reopen the picker."""
+        if self.history:
+            self._root_confirm = False
             self.action_back()
+            return
+        if self._root_confirm:
+            self._root_confirm = False
+            self.action_pick_file()
+        else:
+            self._root_confirm = True
+            self._status("at the root — press h / backspace again for fuzzy file search")
+
+    def on_key(self, event: events.Key) -> None:
+        # Any key other than the walk-up pair disarms the pending "go to picker"
+        # confirmation, so the double-press must be consecutive.
+        # Ref: https://textual.textualize.io/guide/input/#key-events
+        if event.key not in ("h", "backspace"):
+            self._root_confirm = False
 
     # -- misc actions -------------------------------------------------------
 
@@ -837,6 +885,99 @@ class PithApp(App):
         except Exception as e:
             self._status(f"editor failed: {e}")
 
+    # -- user-configured commands -------------------------------------------
+
+    def _cmd_context(self) -> tuple[dict[str, str], str] | None:
+        """(PITH_* env vars, snippet) for the cursor node, or None."""
+        tree = self.query_one(Tree)
+        node = tree.cursor_node
+        if node is None or not isinstance(node.data, dict) or self.current is None:
+            return None
+        data = node.data
+        line = data.get("line")
+        if not isinstance(line, int) or line < 1:
+            return None
+        rel = self.current.path
+        try:
+            src = (self.indexer.root / rel).read_text(encoding="utf-8",
+                                                      errors="replace").splitlines()
+        except OSError:
+            return None
+        # a def's snippet is its whole block (tree-sitter end_line); anything
+        # else (call, import, doc line) is just its own source line
+        end = max(data.get("end_line", line), line)
+        snippet = "\n".join(src[line - 1:end])
+        line_text = src[line - 1].strip() if line <= len(src) else ""
+        crumb = self._breadcrumb()  # ancestor chain, e.g. "Renderer › paint"
+        symbol = f"{crumb} — {line_text}" if crumb else line_text
+        doc = next((ch.data.get("text", "") for ch in node.children
+                    if isinstance(ch.data, dict) and ch.data.get("kind") == "doc"), "")
+        if doc:
+            symbol += f" · {doc}"
+        target = ""
+        if data.get("kind") == "ref" and data.get("targets"):
+            loc = data["targets"][0]  # where the call/import resolves to
+            target = f"{loc.path}:{loc.line}"
+        env = {"PITH_ROOT": str(self.indexer.root),
+               "PITH_FILE": str(self.indexer.root / rel),
+               "PITH_REL": rel,
+               "PITH_LINE": str(line),
+               "PITH_END_LINE": str(end),
+               "PITH_KIND": data.get("kind", ""),
+               "PITH_SYMBOL": symbol,
+               "PITH_TARGET": target}
+        return env, snippet
+
+    def action_user_cmd(self, key: str) -> None:
+        cmd = self.user_cmds.get(key)
+        if cmd is None:
+            return
+        ctx = self._cmd_context()
+        if ctx is None:
+            self._status(f"{cmd.run}: nothing under the cursor to send")
+            return
+        pith_env, snippet = ctx
+        prog = os.path.expanduser(cmd.run)
+        if not os.path.isabs(prog) and (self.indexer.root / prog).is_file():
+            prog = str(self.indexer.root / prog)  # project-relative script
+        env = {**os.environ, **pith_env}
+        if cmd.suspend:
+            # interactive script: leave the TUI like the terminal-editor
+            # hand-off. stdin stays the terminal here, so the snippet travels
+            # in PITH_SNIPPET instead of the pipe background commands get.
+            env["PITH_SNIPPET"] = snippet
+            try:
+                with self.suspend():
+                    proc = subprocess.run([prog], cwd=self.indexer.root, env=env)
+                self.refresh()
+                self._status(f"{cmd.run}: exit {proc.returncode}")
+            except Exception as e:
+                self._status(f"{cmd.run}: {e}")
+        else:
+            self._run_user_cmd(cmd, [prog], env, snippet)
+
+    @work(thread=True, exclusive=False)
+    def _run_user_cmd(self, cmd: UserCommand, argv: list[str], env: dict,
+                      snippet: str) -> None:
+        """Run a configured script off the UI thread; report its outcome."""
+        try:
+            # Metadata rides in PITH_* env vars; the snippet is piped to stdin
+            # so large blocks can't blow the kernel's shared argv+env budget.
+            # Ref: https://docs.python.org/3/library/subprocess.html#subprocess.run
+            proc = subprocess.run(argv, cwd=self.indexer.root, env=env,
+                                  input=snippet, capture_output=True, text=True,
+                                  timeout=cmd.timeout)
+            out = (proc.stdout or proc.stderr).strip().splitlines()
+            tail = f" · {out[-1][:80]}" if out else ""
+            msg = f"{cmd.run}: exit {proc.returncode}{tail}"
+        except FileNotFoundError:
+            msg = f"{cmd.run}: not found (PATH or repo-relative)"
+        except subprocess.TimeoutExpired:
+            msg = f"{cmd.run}: timed out after {cmd.timeout}s"
+        except Exception as e:
+            msg = f"{cmd.run}: {e}"
+        self.call_from_thread(self._status, msg)
+
 
 def _fzf_pick_file(root: Path) -> str | None:
     """Pick a source file with fzf before pith boots (fast external picker).
@@ -884,6 +1025,52 @@ def main(argv: list[str] | None = None) -> None:
         prog="pith",
         description="Skeleton-first codebase navigation: definitions, docstrings "
                     "and outgoing calls, one file at a time.",
+        # RawDescriptionHelpFormatter keeps the epilog's hand-wrapped layout.
+        # Ref: https://docs.python.org/3/library/argparse.html#formatter-class
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""\
+config — custom keybindings:
+  pith reads two optional JSON config files (project overrides global per key):
+
+    global    $XDG_CONFIG_HOME/pith/config.json   (~/.config/pith/config.json)
+    project   <repo root>/.pith.json
+
+  each entry binds a key to a script of your own:
+
+    {
+      "commands": {
+        "y":      {"run": "scripts/yank.sh", "desc": "yank snippet"},
+        "ctrl+t": {"run": "~/bin/ticket.sh", "desc": "file ticket",
+                   "suspend": true},
+        "Y":      "scripts/quick.sh"
+      }
+    }
+
+  options per command:
+    run      script/executable; relative paths resolve against the repo root
+    desc     footer label (default: the run value)
+    suspend  true = leave the TUI so the script can be interactive
+             (pager, fzf, lazygit, ...); default false = run in background
+    timeout  seconds before a background command is killed (default 60)
+
+  keys use Textual names ("y", "Y", "ctrl+t", ...); keys that shadow a
+  built-in binding are skipped with a warning at startup.
+
+  the script runs with cwd = repo root, no positional args; the current
+  selection arrives in environment variables:
+
+    PITH_ROOT      absolute repo root (== the cwd)
+    PITH_FILE      absolute path of the current file
+    PITH_REL       repo-relative path of the current file
+    PITH_LINE      1-based line of the selection
+    PITH_END_LINE  last line of the selection (a def's block end)
+    PITH_KIND      def / ref / doc / plain
+    PITH_SYMBOL    ancestor chain + source line (+ first doc line)
+    PITH_TARGET    path:line a call/import resolves to (refs only)
+
+  the snippet (PITH_LINE..PITH_END_LINE) is piped to stdin; with
+  "suspend": true stdin stays the terminal, so it arrives in PITH_SNIPPET.
+""",
     )
     ap.add_argument("path", nargs="?", default=".",
                     help="repo root, subdirectory, or a file to open")
