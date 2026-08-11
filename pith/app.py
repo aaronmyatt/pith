@@ -45,9 +45,60 @@ KIND_ICON = {
     "constant": ("π", "yellow"),
     "module": ("▤", "blue"),
     "type": ("τ", "bright_magenta"),
+    "enum": ("∷", "yellow"),
+    "key": ("∙", "grey70"),
+    "table": ("▥", "bright_blue"),
 }
 
 MAX_DOC_LINES = 14
+
+# Next.js App Router special files and what they contribute to a route segment.
+# Ref: https://nextjs.org/docs/app/api-reference/file-conventions
+_NEXT_SPECIAL = {
+    "page": "page", "layout": "layout", "route": "API route",
+    "loading": "loading UI", "error": "error UI", "global-error": "global error UI",
+    "not-found": "not-found UI", "template": "template",
+    "default": "parallel-route fallback",
+}
+_NEXT_EXTS = {".ts", ".tsx", ".js", ".jsx", ".mjs"}
+
+
+def _nextjs_role(path: str) -> str | None:
+    """Route annotation ("/dashboard · page") for Next.js convention files.
+
+    Route groups "(group)", parallel slots "@slot" and private "_folders" are
+    dropped from the displayed route, matching how Next.js maps URLs; dynamic
+    "[param]" segments are kept verbatim.
+    Ref: https://nextjs.org/docs/app/api-reference/file-conventions/dynamic-routes
+    """
+    p = Path(path)
+    if p.suffix not in _NEXT_EXTS:
+        return None
+    parts = p.parts
+    in_src = len(parts) > 1 and parts[0] == "src"
+    if p.stem in ("middleware", "instrumentation") and len(parts) == (2 if in_src else 1):
+        return p.stem
+    for router in ("app", "pages"):
+        if router not in parts:
+            continue
+        i = parts.index(router)
+        if i != (1 if in_src else 0):
+            continue
+        segs = [s for s in parts[i + 1:-1]
+                if not (s.startswith("(") or s.startswith("@") or s.startswith("_"))]
+        if router == "app":
+            role = _NEXT_SPECIAL.get(p.stem)
+            if role is None:
+                return None
+            return f"/{'/'.join(segs)} · {role}"
+        # Pages Router. Ref: https://nextjs.org/docs/pages/building-your-application/routing
+        if p.stem in ("_app", "_document", "_error"):
+            return f"custom {p.stem.lstrip('_')}"
+        if p.stem != "index":
+            segs.append(p.stem)
+        role = "API route" if segs[:1] == ["api"] else "page"
+        return f"/{'/'.join(segs)} · {role}".replace("// ", "/ ")
+    return None
 
 
 def _def_label(d: Definition) -> Text:
@@ -211,6 +262,55 @@ class HelpScreen(ModalScreen):
         self.dismiss(None)
 
 
+class SkeletonTree(Tree):
+    """Tree whose cursor treats a run of doc-comment lines as one stop.
+
+    Docstrings render as one leaf per line (kind "doc"), so the stock cursor
+    stops on every line. Overriding the cursor actions here covers every entry
+    point at once: the arrow keys (Tree's own up/down bindings) and the app's
+    j/k bindings, which delegate to these same actions.
+    Ref: https://textual.textualize.io/widgets/tree/#textual.widgets.Tree.action_cursor_down
+    """
+
+    def _is_doc_line(self, line: int) -> bool:
+        # get_node_at_line maps a visible (expanded) line index to its node,
+        # or None past either end of the tree.
+        # Ref: https://textual.textualize.io/widgets/tree/#textual.widgets.Tree.get_node_at_line
+        node = self.get_node_at_line(line)
+        return (node is not None and isinstance(node.data, dict)
+                and node.data.get("kind") == "doc")
+
+    def _cursor_step(self, delta: int) -> None:
+        line = self.cursor_line  # -1 while the tree has no cursor yet
+        dest = line + delta
+        if self._is_doc_line(line):
+            # already on a block's first line — hop past its remaining lines
+            while dest >= 0 and self._is_doc_line(dest):
+                dest += delta
+        elif delta < 0 and self._is_doc_line(dest):
+            # entering a block from below — snap to its first line so the
+            # block is one stop in both directions
+            while dest > 0 and self._is_doc_line(dest - 1):
+                dest -= 1
+        node = self.get_node_at_line(dest) if dest >= 0 else None
+        if node is not None:
+            # move_cursor also scrolls the target into view.
+            # Ref: https://textual.textualize.io/widgets/tree/#textual.widgets.Tree.move_cursor
+            self.move_cursor(node)
+
+    def action_cursor_down(self) -> None:
+        if self.cursor_line < 0:
+            super().action_cursor_down()
+        else:
+            self._cursor_step(1)
+
+    def action_cursor_up(self) -> None:
+        if self.cursor_line < 0:
+            super().action_cursor_up()
+        else:
+            self._cursor_step(-1)
+
+
 class PithApp(App):
     TITLE = "pith"
 
@@ -264,7 +364,7 @@ class PithApp(App):
         yield Input(placeholder="search — type to narrow the current screen (enter commit · esc cancel)",
                     id="search")
         yield LoadingIndicator(id="loading")
-        yield Tree("", id="skeleton")
+        yield SkeletonTree("", id="skeleton")
         yield Footer()
 
     def on_mount(self) -> None:
@@ -423,7 +523,10 @@ class PithApp(App):
         narrowed = bool(needle)
         tree = self.query_one(Tree)
         tree.clear()
-        tree.root.set_label(fv.path)
+        root_label = Text(fv.path)
+        if (role := _nextjs_role(fv.path)):
+            root_label.append(f"  ▸ {role}", style="dim green")
+        tree.root.set_label(root_label)
         if fv.error:
             tree.root.add_leaf(Text(fv.error, style="red"),
                                data={"kind": "plain", "line": 1, "text": fv.error})

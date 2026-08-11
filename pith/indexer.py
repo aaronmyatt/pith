@@ -11,6 +11,7 @@ derives them from the individual tree-sitter grammar repos.
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import subprocess
@@ -85,6 +86,77 @@ class FileView:
 
 
 # ---------------------------------------------------------------------------
+
+def _jsonc_loads(text: str):
+    """Parse JSONC: tsconfig.json allows // and /* */ comments and trailing commas.
+    Ref: https://www.typescriptlang.org/docs/handbook/tsconfig-json.html
+    """
+    text = re.sub(r"/\*.*?\*/", "", text, flags=re.S)
+    text = re.sub(r"^\s*//[^\n]*", "", text, flags=re.M)
+    text = re.sub(r",\s*([}\]])", r"\1", text)
+    return json.loads(text)
+
+
+def _load_ts_aliases(root: Path) -> tuple[str, dict[str, list[str]]]:
+    """(baseUrl, paths) from tsconfig.json or jsconfig.json, following a local
+    `extends` chain. Both fields configure module resolution aliases like
+    "@/*": ["./src/*"].
+    Ref: https://www.typescriptlang.org/tsconfig/#paths
+    """
+    for name in ("tsconfig.json", "jsconfig.json"):
+        base_url, paths = "", {}
+        p, seen = root / name, set()
+        for _ in range(5):  # bounded extends chain
+            if p in seen or not p.is_file():
+                break
+            seen.add(p)
+            try:
+                cfg = _jsonc_loads(p.read_text())
+            except Exception:
+                break
+            co = cfg.get("compilerOptions") or {}
+            # nearer configs win over extended bases
+            if not base_url and co.get("baseUrl"):
+                base_url = co["baseUrl"]
+            for pat, targets in (co.get("paths") or {}).items():
+                if isinstance(targets, list):
+                    paths.setdefault(pat, targets)
+            ext = cfg.get("extends")
+            if not isinstance(ext, str) or not ext.startswith("."):
+                break  # package-based extends (e.g. "@tsconfig/next") — skip
+            p = (p.parent / ext).resolve()
+            if p.suffix != ".json":
+                p = p.with_suffix(".json")
+        if base_url or paths:
+            return base_url, paths
+    return "", {}
+
+
+
+# grep_ast's PARSERS table (github.com/paul-gauthier/grep-ast) maps .json/.toml
+# to a language but has no .yaml/.yml entry — fill the gap ourselves.
+_EXTRA_LANG_EXT = {".yaml": "yaml", ".yml": "yaml"}
+
+# Data-file languages: structural (keys/tables), not code. They get a
+# skeleton view like any other file, but contribute no calls/imports and are
+# excluded from the project-wide symbol table (see build_symbol_table) so
+# that e.g. every "name" key across every package.json doesn't turn into a
+# cross-repo symbol-jump target.
+STRUCTURAL_LANGS = {"json", "yaml", "toml"}
+
+
+def _lang_for(rel: str) -> str | None:
+    # tree-sitter ships TypeScript as two grammars: `typescript` (where <T> is a
+    # type assertion) and `tsx` (where <T> opens a JSX element). filename_to_lang()
+    # maps .tsx to "typescript", which cannot parse JSX — route it to "tsx".
+    # Ref: https://github.com/tree-sitter/tree-sitter-typescript#typescript-and-tsx
+    lang = filename_to_lang(rel)
+    if lang == "typescript" and rel.endswith(".tsx"):
+        return "tsx"
+    if lang is None:
+        lang = _EXTRA_LANG_EXT.get(Path(rel).suffix.lower())
+    return lang
+
 
 _query_cache: dict[str, Query | None] = {}
 
@@ -201,6 +273,7 @@ class Indexer:
         self.symbols: dict[str, list[Location]] = {}
         self.files: list[str] = []
         self._file_set: set[str] = set()
+        self._ts_base_url, self._ts_paths = _load_ts_aliases(self.root)
 
     # -- repo walking -------------------------------------------------------
 
@@ -229,7 +302,7 @@ class Indexer:
         return files
 
     def source_files(self) -> list[str]:
-        return [f for f in self.files if filename_to_lang(f)]
+        return [f for f in self.files if _lang_for(f)]
 
     # -- project symbol table ----------------------------------------------
 
@@ -245,8 +318,8 @@ class Indexer:
                 continue
 
     def _index_file_defs(self, rel: str) -> None:
-        lang = filename_to_lang(rel)
-        if not lang:
+        lang = _lang_for(rel)
+        if not lang or lang in STRUCTURAL_LANGS:
             return
         query = _load_query(lang)
         if query is None:
@@ -274,7 +347,7 @@ class Indexer:
     # -- single-file view ---------------------------------------------------
 
     def file_view(self, rel: str) -> FileView:
-        lang = filename_to_lang(rel)
+        lang = _lang_for(rel)
         fv = FileView(path=rel, lang=lang)
         path = self.root / rel
         try:
@@ -436,6 +509,32 @@ class Indexer:
 
         return sorted(locs, key=proximity)[:20]
 
+    def _expand_alias(self, cand: str) -> list[str]:
+        """Expand an import specifier through tsconfig "paths" aliases.
+
+        Each pattern contains at most one '*' wildcard; matched targets are
+        resolved relative to baseUrl (which itself is tsconfig-dir-relative, so
+        repo-root-relative for a root tsconfig).
+        Ref: https://www.typescriptlang.org/tsconfig/#paths
+        """
+        out: list[str] = []
+        base = self._ts_base_url.lstrip("./")
+        for pattern, targets in self._ts_paths.items():
+            pre, star, suf = pattern.partition("*")
+            if star:
+                if not (cand.startswith(pre) and cand.endswith(suf)
+                        and len(cand) >= len(pre) + len(suf)):
+                    continue
+                matched = cand[len(pre):len(cand) - len(suf)]
+            elif pattern == cand:
+                matched = ""
+            else:
+                continue
+            for t in targets:
+                t = t.replace("*", matched).lstrip("./")
+                out.append(os.path.normpath(os.path.join(base, t)) if base else t)
+        return out
+
     def _resolve_import(self, from_file: str, text: str) -> list[Location]:
         """Best-effort: map an import statement to project files."""
         candidates: list[str] = []
@@ -451,14 +550,24 @@ class Indexer:
                 ".java", ".kt", ".swift", ".c", ".h", ".cpp", ".hpp", ".cs", ".php"]
         base = Path(from_file).parent
         for cand in candidates:
-            cand = cand.lstrip("@")
             paths: list[str] = []
             if cand.startswith("."):
                 joined = os.path.normpath(str(base / cand))
                 paths.append(joined)
+            elif (aliased := self._expand_alias(cand)):
+                paths.extend(aliased)
+            elif cand.startswith("@/"):
+                # "@/x" is the conventional Next.js/Vite alias for the project root
+                # or src/ — fallback when no tsconfig/jsconfig declares "paths".
+                # Ref: https://nextjs.org/docs/app/getting-started/installation#set-up-absolute-imports-and-module-path-aliases
+                paths.append(cand[2:])
+                paths.append("src/" + cand[2:])
+            else:
+                paths.append(cand.lstrip("@"))
             paths.append(cand)
             for p in paths:
-                for suffix in [""] + exts + ["/__init__.py", "/index.ts", "/index.js", "/mod.rs"]:
+                for suffix in [""] + exts + ["/__init__.py", "/index.ts", "/index.tsx",
+                                             "/index.js", "/index.jsx", "/mod.rs"]:
                     trial = p + suffix
                     if trial in self._file_set and trial != from_file:
                         out.append(Location(trial, 1, "file"))

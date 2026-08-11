@@ -26,6 +26,20 @@ def parse(source):
     return source
 '''
 
+C = '''\
+def alpha():
+    """Line one.
+
+    Line two.
+    Line three.
+    """
+    return beta()
+
+
+def beta():
+    return 1
+'''
+
 
 def top_names(tree):
     return [n.data.get("name") for n in tree.root.children if isinstance(n.data, dict)]
@@ -49,6 +63,7 @@ async def main():
         root = Path(td)
         (root / "a.py").write_text(A)
         (root / "b.py").write_text(B)
+        (root / "c.py").write_text(C)
         # user-command config: global registers t (+ a reserved key, skipped);
         # the project file overrides t's description
         (root / "pith").mkdir()
@@ -349,6 +364,34 @@ async def main():
             assert got[3] == "b.py:1", "PITH_TARGET carries the resolved definition"
             assert stdin_copy.read_text() == A.splitlines()[4],                 "ref snippet is its single source line"
 
+            # ---- 6. j/k treat a multi-line doc block as one cursor stop ----
+            app.open_file("c.py")
+            await pilot.pause()
+            await pilot.press("x"); await pilot.pause()   # expand all
+            t = app.query_one(Tree)
+            t.move_cursor(t.get_node_at_line(0)); await pilot.pause()
+            cur = t.cursor_node
+            assert cur.data.get("kind") == "def" and cur.data.get("name") == "alpha", cur.data
+            await pilot.press("j"); await pilot.pause()
+            assert t.cursor_node.data.get("kind") == "doc" and t.cursor_line == 1,                 "j enters the doc block on its first line"
+            await pilot.press("j"); await pilot.pause()
+            assert t.cursor_node.data.get("kind") == "ref",                 "j hops the rest of the block in one press"
+            await pilot.press("j"); await pilot.pause()
+            cur = t.cursor_node
+            assert cur.data.get("kind") == "def" and cur.data.get("name") == "beta", cur.data
+            await pilot.press("k"); await pilot.pause()
+            assert t.cursor_node.data.get("kind") == "ref", "k back onto the call line"
+            await pilot.press("k"); await pilot.pause()
+            assert t.cursor_node.data.get("kind") == "doc" and t.cursor_line == 1,                 "k snaps to the block's first line from below"
+            await pilot.press("k"); await pilot.pause()
+            cur = t.cursor_node
+            assert cur.data.get("kind") == "def" and cur.data.get("name") == "alpha",                 "k exits the block upward in one press"
+            # arrow keys go through the same block-aware cursor actions
+            await pilot.press("down"); await pilot.pause()
+            assert t.cursor_node.data.get("kind") == "doc" and t.cursor_line == 1
+            await pilot.press("down"); await pilot.pause()
+            assert t.cursor_node.data.get("kind") == "ref",                 "arrow down hops the block like j"
+
             print("ALL TESTS PASSED")
 
 
@@ -412,3 +455,107 @@ def test_fzf_pick():
 
 
 test_fzf_pick()
+
+
+def test_react_tsx():
+    """Indexer React/Next.js support: tsx grammar routing, TS-only defs,
+    JSX component refs, and @/ path-alias import resolution."""
+    from pith.indexer import Indexer, _lang_for
+
+    # .tsx must use the `tsx` grammar — plain `typescript` cannot parse JSX.
+    # Ref: https://github.com/tree-sitter/tree-sitter-typescript#typescript-and-tsx
+    assert _lang_for("app/page.tsx") == "tsx"
+    assert _lang_for("lib/format.ts") == "typescript"
+    assert _lang_for("components/Legacy.jsx") == "javascript"
+
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        (root / "components").mkdir()
+        (root / "app").mkdir()
+        (root / "components" / "Button.tsx").write_text(
+            "interface ButtonProps { label: string }\n"
+            "/** Primary action button. */\n"
+            "export default function Button({ label }: ButtonProps) {\n"
+            "  return <button>{label}</button>;\n"
+            "}\n")
+        (root / "app" / "page.tsx").write_text(
+            "import Button from '@/components/Button';\n"
+            "export default function Home() {\n"
+            "  return <main><Button label='add' /><div /></main>;\n"
+            "}\n")
+        ix = Indexer(root)
+        ix.discover_files()
+        ix.build_symbol_table()
+
+        btn = ix.file_view("components/Button.tsx")
+        assert not btn.error, btn.error
+        kinds = {d.name: d.kind for d in btn.defs}
+        assert kinds == {"ButtonProps": "interface", "Button": "function"}, kinds
+        assert next(d for d in btn.defs if d.name == "Button").docstring == \
+            "Primary action button."
+
+        page = ix.file_view("app/page.tsx")
+        # "@/x" alias resolves against the project root (Next.js convention)
+        assert [t.path for t in page.imports[0].targets] == ["components/Button.tsx"]
+        home = page.defs[0]
+        refs = {r.name: [t.path for t in r.targets] for r in home.refs}
+        assert refs.get("Button") == ["components/Button.tsx"], refs
+        assert "div" not in refs, "lowercase JSX elements are host tags, not refs"
+    print("react/tsx OK")
+
+
+test_react_tsx()
+
+
+def test_nextjs():
+    """tsconfig "paths" alias resolution + Next.js route-role annotation."""
+    from pith.indexer import Indexer
+    from pith.app import _nextjs_role
+
+    # -- route roles (pure path logic) -----------------------------------
+    assert _nextjs_role("app/page.tsx") == "/ · page"
+    assert _nextjs_role("src/app/(shop)/cart/[id]/page.tsx") == "/cart/[id] · page"
+    assert _nextjs_role("app/api/users/route.ts") == "/api/users · API route"
+    assert _nextjs_role("app/dashboard/layout.tsx") == "/dashboard · layout"
+    assert _nextjs_role("pages/blog/[slug].tsx") == "/blog/[slug] · page"
+    assert _nextjs_role("pages/index.tsx") == "/ · page"
+    assert _nextjs_role("pages/api/hello.ts") == "/api/hello · API route"
+    assert _nextjs_role("pages/_app.tsx") == "custom app"
+    assert _nextjs_role("middleware.ts") == "middleware"
+    assert _nextjs_role("app/utils.ts") is None, "non-convention files unlabeled"
+    assert _nextjs_role("lib/app/page.tsx") is None, "only root/src app dirs count"
+    assert _nextjs_role("app/page.css") is None
+
+    # -- tsconfig paths aliases ------------------------------------------
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        (root / "src" / "ui").mkdir(parents=True)
+        (root / "src" / "app").mkdir()
+        # JSONC on purpose: comments + trailing comma must not break parsing
+        (root / "tsconfig.base.json").write_text(
+            '{\n'
+            '  // shared compiler options\n'
+            '  "compilerOptions": {\n'
+            '    "paths": { "~ui/*": ["./src/ui/*"], },\n'
+            '  },\n'
+            '}\n')
+        (root / "tsconfig.json").write_text(
+            '{ "extends": "./tsconfig.base.json",\n'
+            '  "compilerOptions": { "paths": { "@/*": ["./src/*"] } } }\n')
+        (root / "src" / "ui" / "Card.tsx").write_text(
+            "export const Card = () => <div />;\n")
+        (root / "src" / "app" / "page.tsx").write_text(
+            "import { Card } from '~ui/Card';\n"
+            "import { Card as C2 } from '@/ui/Card';\n"
+            "export default function Home() { return <Card />; }\n")
+        ix = Indexer(root)
+        ix.discover_files()
+        ix.build_symbol_table()
+        page = ix.file_view("src/app/page.tsx")
+        for imp in page.imports:
+            assert [t.path for t in imp.targets] == ["src/ui/Card.tsx"], \
+                (imp.text, imp.targets)
+    print("nextjs OK")
+
+
+test_nextjs()

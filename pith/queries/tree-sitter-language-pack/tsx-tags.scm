@@ -1,3 +1,8 @@
+; TSX tags query: typescript-tags.scm base plus JSX component references.
+; Node names come from the tree-sitter-typescript grammar; the same file works
+; for the `typescript` and `tsx` grammars since tsx is a node-type superset.
+; Ref: https://github.com/tree-sitter/tree-sitter-typescript/blob/master/queries/tags.scm
+
 (
   (comment)* @doc
   .
@@ -16,6 +21,8 @@
       name: (_) @name.definition.class)
     (class_declaration
       name: (_) @name.definition.class)
+    (abstract_class_declaration
+      name: (type_identifier) @name.definition.class)
   ] @definition.class
   (#strip! @doc "^[\\s\\*/]+|^[\\s\\*/]$")
   (#select-adjacent! @doc @definition.class)
@@ -32,6 +39,8 @@
     (generator_function
       name: (identifier) @name.definition.function)
     (generator_function_declaration
+      name: (identifier) @name.definition.function)
+    (function_signature
       name: (identifier) @name.definition.function)
   ] @definition.function
   (#strip! @doc "^[\\s\\*/]+|^[\\s\\*/]$")
@@ -73,6 +82,45 @@
   key: (property_identifier) @name.definition.function
   value: [(arrow_function) (function_expression)]) @definition.function
 
+; -- TypeScript-only declarations ------------------------------------------
+
+(
+  (comment)* @doc
+  .
+  (interface_declaration
+    name: (type_identifier) @name.definition.interface) @definition.interface
+  (#strip! @doc "^[\\s\\*/]+|^[\\s\\*/]$")
+  (#select-adjacent! @doc @definition.interface)
+)
+
+(
+  (comment)* @doc
+  .
+  (type_alias_declaration
+    name: (type_identifier) @name.definition.type) @definition.type
+  (#strip! @doc "^[\\s\\*/]+|^[\\s\\*/]$")
+  (#select-adjacent! @doc @definition.type)
+)
+
+(
+  (comment)* @doc
+  .
+  (enum_declaration
+    name: (identifier) @name.definition.enum) @definition.enum
+  (#strip! @doc "^[\\s\\*/]+|^[\\s\\*/]$")
+  (#select-adjacent! @doc @definition.enum)
+)
+
+; declaration-file / ambient constructs (.d.ts)
+(method_signature
+  name: (property_identifier) @name.definition.method) @definition.method
+(abstract_method_signature
+  name: (property_identifier) @name.definition.method) @definition.method
+(module
+  name: (identifier) @name.definition.module) @definition.module
+
+; -- references -------------------------------------------------------------
+
 (
   (call_expression
     function: (identifier) @name.reference.call) @reference.call
@@ -86,6 +134,10 @@
 
 (new_expression
   constructor: (_) @name.reference.class) @reference.class
+
+; type usage in annotations, extends clauses, generics, etc.
+(type_annotation
+  (type_identifier) @name.reference.type) @reference.type
 
 ; -- JSX (React) ------------------------------------------------------------
 ; <Button /> and <Button>...</Button> link component usage to its definition.
