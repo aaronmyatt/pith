@@ -6,10 +6,11 @@ details stay hidden until you jump to your editor. When `fzf` is available,
 startup picks the file with fzf first (instant) so the slower Textual boot
 lands straight in the file; otherwise pith's built-in picker opens.
 
-Navigation is vim-flavoured: `l` drills down (expand a definition, descend into
-its calls, or follow a call/import into another file), `h` or backspace walks
-back up (collapse, move to parent, or pop back to the previous file; at the
-very root, a second press reopens the fuzzy file search). `/` starts an
+Navigation is vim-flavoured: `l` (or right arrow) drills down (expand a
+definition, descend into its calls, or follow a call/import into another
+file), `h`, backspace, or left arrow walks back up (collapse, move to parent,
+or pop back to the previous file; at the very root, a second press reopens
+the fuzzy file search). `/` starts an
 incremental search that narrows the current screen to anything visible on it —
 definitions, calls, imports, doc lines — and the narrow follows you as you
 drill across files.
@@ -25,6 +26,7 @@ import subprocess
 import sys
 from pathlib import Path
 
+from rich.syntax import Syntax
 from rich.text import Text
 from textual import events, work
 from textual.app import App, ComposeResult
@@ -48,9 +50,11 @@ KIND_ICON = {
     "enum": ("∷", "yellow"),
     "key": ("∙", "grey70"),
     "table": ("▥", "bright_blue"),
+    "section": ("§", "green"),
 }
 
 MAX_DOC_LINES = 14
+MAX_DOC_LINE_CHARS = 100  # doc lines longer than this collapse; drill in to read the rest
 
 # Next.js App Router special files and what they contribute to a route segment.
 # Ref: https://nextjs.org/docs/app/api-reference/file-conventions
@@ -145,6 +149,32 @@ def _search_text(name: str, targets: list[Location]) -> str:
     return t
 
 
+_DOC_STYLE = "italic #8a8a8a"
+_md_syntax: Syntax | None = None
+
+
+def _doc_text(s: str, lang: str | None) -> Text:
+    """Style one line of a definition's doc/comment body.
+
+    Markdown section bodies are prose, not comments — highlight them with
+    real markdown syntax colouring (headings/bold/code/links) instead of the
+    plain dim-italic look every other language's docstrings/comments get.
+    Ref: https://rich.readthedocs.io/en/stable/syntax.html
+    """
+    if lang == "markdown" and s.strip():
+        global _md_syntax
+        if _md_syntax is None:
+            _md_syntax = Syntax("", "markdown", theme="ansi_dark", background_color="default")
+        try:
+            t = _md_syntax.highlight(s)
+            if t.plain.endswith("\n"):
+                t = t[: len(t) - 1]
+            return t
+        except Exception:
+            pass
+    return Text(s, style=_DOC_STYLE)
+
+
 class PickScreen(ModalScreen):
     """Generic filterable picker (files, symbols, ambiguous targets)."""
 
@@ -230,8 +260,8 @@ class HelpScreen(ModalScreen):
 [bold]pith — keys[/bold]
 
   j / k, ↑ / ↓      move
-  l                 drill down: expand a definition · descend into its calls
-  h / backspace     walk up: collapse · move to parent · back a file
+  l / →             drill down: expand a definition · descend into its calls
+  h / backspace / ← walk up: collapse · move to parent · back a file
                     (at the root, press twice for the fuzzy file search)
   enter / click     drill down (same as l): expand · descend · follow call
   e  or  ctrl+enter open current item in $EDITOR at its line
@@ -310,6 +340,18 @@ class SkeletonTree(Tree):
         else:
             self._cursor_step(-1)
 
+    # ScrollView (an ancestor class) binds left/right to horizontal scrolling,
+    # which — being declared on the focused widget itself — intercepts the key
+    # before it would otherwise bubble up to PithApp's own left/right bindings.
+    # Repoint them at the app's h/l actions instead, so arrow keys are full
+    # aliases for h/l rather than scrolling a tree that never scrolls sideways.
+    # Ref: https://textual.textualize.io/guide/input/#bindings
+    def action_scroll_left(self) -> None:
+        self.app.action_walk_up()
+
+    def action_scroll_right(self) -> None:
+        self.app.action_drill()
+
 
 class PithApp(App):
     TITLE = "pith"
@@ -322,8 +364,8 @@ class PithApp(App):
         Binding("g", "jump_symbol", show=False),
         Binding("m", "mark", show=False),
         Binding("M", "marks", show=False),
-        Binding("l", "drill", "drill"),
-        Binding("h,backspace", "walk_up", "up"),
+        Binding("l,right", "drill", "drill"),
+        Binding("h,backspace,left", "walk_up", "up"),
         Binding("b", "back", "back"),
         Binding("e,o,ctrl+enter", "open_editor", "editor"),
         Binding("escape", "clear_search", "clear", show=False),
@@ -571,9 +613,20 @@ class PithApp(App):
                 lines = d.docstring.splitlines()
                 for ln in lines[:MAX_DOC_LINES]:
                     if self._keep(ln):
-                        node.add_leaf(self._highlight_matches(
-                            Text(f"  {ln}" if ln else "", style="italic #8a8a8a")),
-                            data={"kind": "doc", "line": d.line, "text": ln})
+                        doc_data = {"kind": "doc", "line": d.line, "text": ln}
+                        full = (Text("  ") + _doc_text(ln, fv.lang)) if ln else Text()
+                        if len(full.plain) > MAX_DOC_LINE_CHARS:
+                            # full text still lives in doc_data["text"] for search/
+                            # PITH_SYMBOL context; only the label is cut short — drill
+                            # in (l / right / enter) to read the rest.
+                            cut = ln[:MAX_DOC_LINE_CHARS - 2].rstrip()
+                            short = (Text("  ") + _doc_text(cut, fv.lang)
+                                    + Text(" …", style=_DOC_STYLE))
+                            doc_node = node.add(self._highlight_matches(short),
+                                                expand=narrowed, data=doc_data)
+                            doc_node.add_leaf(self._highlight_matches(full), data=doc_data)
+                        else:
+                            node.add_leaf(self._highlight_matches(full), data=doc_data)
                         kept = True
                 if len(lines) > MAX_DOC_LINES and (not narrowed or self._keep(text)):
                     node.add_leaf(Text(f"  … {len(lines) - MAX_DOC_LINES} more lines", style="dim"),
@@ -975,18 +1028,40 @@ class PithApp(App):
             elif parts:
                 with self.suspend():
                     subprocess.run(parts + [f"+{line}", full])
-                self.refresh()
+                self._sync_after_edit(rel)
             else:
                 for cand in ("vi", "nano"):
                     from shutil import which
                     if which(cand):
                         with self.suspend():
                             subprocess.run([cand, f"+{line}", full])
-                        self.refresh()
+                        self._sync_after_edit(rel)
                         return
                 self._status("set $EDITOR to enable editor hand-off")
         except Exception as e:
             self._status(f"editor failed: {e}")
+
+    def _sync_after_edit(self, rel: str) -> None:
+        """Recompute rel's definitions/references after a blocking editor exits.
+
+        The editor may have changed line numbers, added/removed/renamed
+        definitions, or edited a file other than the one currently on screen
+        (e.g. after jumping to a ref's definition). Refresh rel's entries in
+        the project symbol table, then re-parse and re-render the file
+        currently on screen so its line numbers and any refs resolving into
+        rel pick up the change; self.refresh() alone only repaints the
+        existing (now possibly stale) tree.
+        """
+        self.indexer.reindex_file(rel)
+        if self.current is not None:
+            tree = self.query_one(Tree)
+            node = tree.cursor_node
+            d = node.data if isinstance(node.data, dict) else None
+            anchor = (d.get("kind"), d.get("line"), d.get("name"),
+                      d.get("text")) if d else None
+            self.current = self.indexer.file_view(self.current.path)
+            self._render(self.current, keep_anchor=anchor)
+        self.refresh()
 
     # -- user-configured commands -------------------------------------------
 
@@ -1052,7 +1127,7 @@ class PithApp(App):
             try:
                 with self.suspend():
                     proc = subprocess.run([prog], cwd=self.indexer.root, env=env)
-                self.refresh()
+                self._sync_after_edit(pith_env["PITH_REL"])
                 self._status(f"{cmd.run}: exit {proc.returncode}")
             except Exception as e:
                 self._status(f"{cmd.run}: {e}")

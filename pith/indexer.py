@@ -137,12 +137,13 @@ def _load_ts_aliases(root: Path) -> tuple[str, dict[str, list[str]]]:
 # to a language but has no .yaml/.yml entry — fill the gap ourselves.
 _EXTRA_LANG_EXT = {".yaml": "yaml", ".yml": "yaml"}
 
-# Data-file languages: structural (keys/tables), not code. They get a
-# skeleton view like any other file, but contribute no calls/imports and are
-# excluded from the project-wide symbol table (see build_symbol_table) so
-# that e.g. every "name" key across every package.json doesn't turn into a
+# Data-file / prose languages: structural (keys/tables/headings), not code.
+# They get a skeleton view like any other file, but contribute no calls/
+# imports and are excluded from the project-wide symbol table (see
+# build_symbol_table) so that e.g. every "name" key across every package.json
+# — or every "## Usage" heading across every README.md — doesn't turn into a
 # cross-repo symbol-jump target.
-STRUCTURAL_LANGS = {"json", "yaml", "toml"}
+STRUCTURAL_LANGS = {"json", "yaml", "toml", "markdown"}
 
 
 def _lang_for(rel: str) -> str | None:
@@ -218,6 +219,29 @@ def _python_docstring(node) -> str:
                 lines = [lines[0].strip()] + [l[pad:] if len(l) >= pad else l for l in body_lines]
             return "\n".join(lines).rstrip()
     return ""
+
+
+def _markdown_body(node, source: bytes) -> str:
+    """Raw text between a markdown section's heading and its first nested
+    subsection (or the section's end, if it has none) — the paragraphs,
+    lists, and code directly under this heading. A nested `section` child
+    marks a subsection's own content, which belongs to that subsection's
+    Definition instead, not this one.
+
+    Only the section's *first* child is its own heading — a setext heading
+    appearing later in the body (which the grammar leaves un-sectioned, see
+    the markdown tags query) is body content, not a second heading to skip.
+    """
+    children = node.named_children
+    if not children or children[0].type not in ("atx_heading", "setext_heading"):
+        return ""
+    heading_end = children[0].end_byte
+    body_end = node.end_byte
+    for ch in children[1:]:
+        if ch.type == "section":
+            body_end = ch.start_byte
+            break
+    return source[heading_end:body_end].decode("utf-8", "replace").strip("\n")
 
 
 _LINE_COMMENT = re.compile(r"^\s*(///?|#|--|;+|%|\*)")
@@ -317,6 +341,21 @@ class Indexer:
             except Exception:
                 continue
 
+    def reindex_file(self, rel: str) -> None:
+        """Drop rel's entries from the symbol table and re-scan it from disk.
+
+        Call after an external edit (e.g. an editor hand-off) so definitions
+        that moved, were renamed, or were added/removed are reflected in
+        cross-file reference resolution without a full repo rescan.
+        """
+        for locs in self.symbols.values():
+            locs[:] = [loc for loc in locs if loc.path != rel]
+        self.symbols = {name: locs for name, locs in self.symbols.items() if locs}
+        try:
+            self._index_file_defs(rel)
+        except Exception:
+            pass
+
     def _index_file_defs(self, rel: str) -> None:
         lang = _lang_for(rel)
         if not lang or lang in STRUCTURAL_LANGS:
@@ -408,7 +447,12 @@ class Indexer:
             doc = ""
             if lang == "python":
                 doc = _python_docstring(def_node)
-            if not doc:
+            elif lang == "markdown" and kind == "section":
+                doc = _markdown_body(def_node, data)
+            # a markdown heading line itself starts with '#', so falling
+            # through to the line-comment scan below would mistake an
+            # adjacent sibling/parent heading for a doc comment.
+            if not doc and lang != "markdown":
                 doc = _comment_docstring(def_node.start_point.row, source_lines)
             defs.append(Definition(
                 name=name,

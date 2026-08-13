@@ -4,7 +4,7 @@ from pathlib import Path
 
 sys.path.insert(0, "/Users/oya/Development/pith")
 from textual.widgets import Tree, Input, Static
-from pith.app import PithApp, PickScreen, _fzf_pick_file
+from pith.app import PithApp, PickScreen, _fzf_pick_file, MAX_DOC_LINE_CHARS
 
 A = '''\
 import b
@@ -40,6 +40,12 @@ def beta():
     return 1
 '''
 
+D = '''\
+def gamma():
+    """This docstring line is deliberately very long, well past a hundred characters, so it must collapse instead of overflowing the screen."""
+    return 1
+'''
+
 
 def top_names(tree):
     return [n.data.get("name") for n in tree.root.children if isinstance(n.data, dict)]
@@ -64,6 +70,7 @@ async def main():
         (root / "a.py").write_text(A)
         (root / "b.py").write_text(B)
         (root / "c.py").write_text(C)
+        (root / "d.py").write_text(D)
         # user-command config: global registers t (+ a reserved key, skipped);
         # the project file overrides t's description
         (root / "pith").mkdir()
@@ -392,6 +399,43 @@ async def main():
             await pilot.press("down"); await pilot.pause()
             assert t.cursor_node.data.get("kind") == "ref",                 "arrow down hops the block like j"
 
+            # ---- 7. left/right mirror h/l (drill in / walk back) -----------
+            app.open_file("a.py"); await pilot.pause()
+            t = app.query_one(Tree)
+            await pilot.press("z"); await pilot.pause()      # collapse all
+            await pilot.press("j"); await pilot.pause()      # imports -> render def
+            cur = t.cursor_node
+            assert cur.data.get("kind") == "def" and cur.data.get("name") == "render", cur.data
+            await pilot.press("right"); await pilot.pause()  # right == l: drill into first call
+            cur = t.cursor_node
+            assert cur.data.get("kind") == "ref", "right descends like l"
+            await pilot.press("right"); await pilot.pause()  # right == l: follow the call -> b.py
+            assert app.current.path == "b.py", app.current.path
+            await pilot.press("left"); await pilot.pause()   # left == h: collapse the landing def
+            assert app.current.path == "b.py" and not t.cursor_node.is_expanded,                 "left collapses the expanded selection like h"
+            await pilot.press("left"); await pilot.pause()   # left == h: pop the navtree
+            assert app.current.path == "a.py", "left walks back up like h"
+
+            # ---- 8. long doc lines collapse; drill in to read the rest -----
+            app.open_file("d.py"); await pilot.pause()
+            t = app.query_one(Tree)
+            await pilot.press("x"); await pilot.pause()      # expand all
+            t.move_cursor(t.get_node_at_line(0)); await pilot.pause()
+            cur = t.cursor_node
+            assert cur.data.get("kind") == "def" and cur.data.get("name") == "gamma", cur.data
+            await pilot.press("j"); await pilot.pause()      # onto the long doc line
+            cur = t.cursor_node
+            assert cur.data.get("kind") == "doc", cur.data
+            full_text = cur.data.get("text")
+            assert len(full_text) > MAX_DOC_LINE_CHARS,                 "fixture line must actually exceed the truncation threshold"
+            label = cur.label.plain
+            assert len(label) <= MAX_DOC_LINE_CHARS + 5 and label.rstrip().endswith("…"),                 "long doc line renders collapsed with an ellipsis"
+            assert cur.children, "collapsed doc line is expandable to read the rest"
+            await pilot.press("right"); await pilot.pause()  # drill in / expand to read the rest
+            cur = t.cursor_node
+            assert cur.data.get("kind") == "doc" and cur.data.get("text") == full_text,                 "drilling into a truncated doc line lands on its full, untruncated text"
+            assert full_text in cur.label.plain,                 "expanded child shows the full line, not just the truncated summary"
+
             print("ALL TESTS PASSED")
 
 
@@ -559,3 +603,190 @@ def test_nextjs():
 
 
 test_nextjs()
+
+
+def test_markdown():
+    """Markdown outline: ATX headings nest by section, symbol table stays clean."""
+    from pith.indexer import Indexer, _lang_for, STRUCTURAL_LANGS
+
+    assert _lang_for("README.md") == "markdown"
+    assert _lang_for("notes.markdown") == "markdown"
+    assert "markdown" in STRUCTURAL_LANGS, "headings shouldn't become repo-wide symbol targets"
+
+    MD = (
+        "# Title\n"
+        "\n"
+        "Intro paragraph.\n"
+        "\n"
+        "## Section A\n"
+        "\n"
+        "Body A.\n"
+        "\n"
+        "### Sub A1\n"
+        "\n"
+        "Body A1.\n"
+        "\n"
+        "## Section B\n"
+        "\n"
+        "Body B.\n"
+        "\n"
+        "Setext, not captured\n"
+        "---------------------\n"
+        "\n"
+        "Flat text, no grammar-level section boundary for this style.\n"
+    )
+
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        (root / "README.md").write_text(MD)
+        ix = Indexer(root)
+        ix.discover_files()
+        ix.build_symbol_table()
+
+        fv = ix.file_view("README.md")
+        assert not fv.error, fv.error
+        assert [d.name for d in fv.defs] == ["Title"], "one top-level heading"
+        title = fv.defs[0]
+        assert [d.name for d in title.children] == ["Section A", "Section B"]
+        section_a = title.children[0]
+        assert [d.name for d in section_a.children] == ["Sub A1"], \
+            "h3 nests under its enclosing h2"
+        sub_a1 = section_a.children[0]
+        assert sub_a1.line == 9 and sub_a1.end_line == 13
+        section_b = title.children[1]
+        assert section_b.children == [], \
+            "setext heading has no grammar-level section, so it's left uncaptured"
+
+        # headings must not pollute the project-wide symbol table (matches
+        # the json/yaml/toml "key"/"table" precedent)
+        assert not any(name in ix.symbols for name in
+                       ("Title", "Section A", "Sub A1", "Section B")), ix.symbols.keys()
+
+        # body text (paragraphs/lists/code) between a heading and its next
+        # subsection loads as that section's docstring, like a comment
+        assert title.docstring == "Intro paragraph.", title.docstring
+        assert section_a.docstring == "Body A.", section_a.docstring
+        assert sub_a1.docstring == "Body A1.", sub_a1.docstring
+        assert "Body B." in section_b.docstring, section_b.docstring
+        assert "Setext, not captured" in section_b.docstring,             "body text runs to the section's end when there's no nested subsection"
+    print("markdown OK")
+
+
+test_markdown()
+
+
+def test_markdown_render():
+    """Markdown section bodies render as syntax-highlighted, truncatable doc text."""
+    asyncio.run(_markdown_render())
+
+
+async def _markdown_render():
+    from textual.widgets import Tree
+    from pith.app import PithApp
+
+    short_line = "This line has `inline code` and stays under a hundred chars total."
+    really_long = ("A very long line of prose that goes on and on well past a hundred "
+                    "characters so it must collapse, with `some code` inside it too.")
+    assert len(really_long) > 100, "fixture must actually exceed the truncation threshold"
+    MD = f"# Title\n\n{short_line}\n\n{really_long}\n"
+
+    with tempfile.TemporaryDirectory() as td:
+        os.environ["XDG_CONFIG_HOME"] = td
+        root = Path(td)
+        (root / "README.md").write_text(MD)
+        app = PithApp(root, start_file="README.md")
+        async with app.run_test() as pilot:
+            for _ in range(300):
+                if app.ready:
+                    break
+                await pilot.pause(0.05)
+            assert app.ready
+            t = app.query_one(Tree)
+            await pilot.press("x"); await pilot.pause()
+            title = t.root.children[0]
+            doc_lines = [ch for ch in title.children
+                        if isinstance(ch.data, dict) and ch.data.get("kind") == "doc"]
+            assert len(doc_lines) == 3, [d.label.plain for d in doc_lines]  # short, blank, truncated
+
+            short_leaf = doc_lines[0]
+            assert "`inline code`" in short_leaf.label.plain
+            assert any("yellow" in str(sp.style) for sp in short_leaf.label.spans),                 "inline code should pick up markdown syntax colour, not just the plain doc style"
+
+            trunc_node = doc_lines[2]
+            assert trunc_node.label.plain.rstrip().endswith("…"), "long body line collapses"
+            assert trunc_node.children, "collapsed body line is expandable to read the rest"
+            full_child = trunc_node.children[0]
+            assert really_long in full_child.label.plain,                 "expanding reveals the full, untruncated (and still highlighted) body line"
+            assert any("yellow" in str(sp.style) for sp in full_child.label.spans),                 "the expanded full line is highlighted too, not just the truncated summary"
+    print("markdown render OK")
+
+
+test_markdown_render()
+
+
+def test_html():
+    """HTML outline: semantic + id'd elements nest like the DOM, div soup skipped."""
+    from pith.indexer import Indexer, _lang_for, STRUCTURAL_LANGS
+
+    assert _lang_for("index.html") == "html"
+    assert _lang_for("page.htm") == "html"
+    assert "html" in STRUCTURAL_LANGS, "elements shouldn't become repo-wide symbol targets"
+
+    HTML = (
+        "<!doctype html>\n"
+        "<html>\n"
+        "<head>\n"
+        "  <title>T</title>\n"
+        '  <script src="app.js"></script>\n'
+        "</head>\n"
+        "<body>\n"
+        "  <header><nav>x</nav></header>\n"
+        "  <main>\n"
+        '    <section id="pricing" class="grid">\n'
+        '      <div class="wrap">\n'
+        '        <form id="signup" method="post"><span>anon</span></form>\n'
+        "      </div>\n"
+        "    </section>\n"
+        "  </main>\n"
+        "  <footer>f</footer>\n"
+        "  <style>body{}</style>\n"
+        "</body>\n"
+        "</html>\n"
+    )
+
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        (root / "index.html").write_text(HTML)
+        ix = Indexer(root)
+        ix.discover_files()
+        ix.build_symbol_table()
+
+        fv = ix.file_view("index.html")
+        assert not fv.error, fv.error
+        assert [d.name for d in fv.defs] == ["html"], "one top-level element"
+        html = fv.defs[0]
+        assert all(d.kind == "element" for d in fv.defs)
+        assert [d.name for d in html.children] == ["head", "body"]
+        head, body = html.children
+        assert [d.name for d in head.children] == ["title", "script"]
+        assert [d.name for d in body.children] == ["header", "main", "footer", "style"]
+        header, main, _footer, _style = body.children
+        assert [d.name for d in header.children] == ["nav"]
+        section = main.children[0]
+        assert section.name == "section" and 'id="pricing"' in section.signature
+        # the anonymous <div class="wrap"> is uncaptured, but byte-containment
+        # nesting still lands its id'd child under the nearest captured ancestor
+        assert [d.name for d in section.children] == ["form"], \
+            "form#signup nests under section#pricing even though its direct parent div is skipped"
+        form = section.children[0]
+        assert 'id="signup"' in form.signature
+        assert form.children == [], "anonymous <span> stays out of the skeleton"
+
+        # elements must not pollute the project-wide symbol table (matches the
+        # markdown/json/yaml/toml structural-language precedent)
+        assert not any(name in ix.symbols for name in
+                       ("html", "body", "section", "form", "nav")), ix.symbols.keys()
+    print("html OK")
+
+
+test_html()
