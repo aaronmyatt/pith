@@ -37,7 +37,8 @@ from textual.widgets import Footer, Input, LoadingIndicator, OptionList, Static,
 from textual.widgets.option_list import Option
 
 from .config import UserCommand, load_user_commands
-from .indexer import Definition, FileView, Indexer, Location
+from .gitstate import GitState, collect as collect_git
+from .indexer import Definition, FileView, Indexer, Location, _lang_for
 
 KIND_ICON = {
     "class": ("◆", "bright_magenta"),
@@ -103,6 +104,13 @@ def _nextjs_role(path: str) -> str | None:
         role = "API route" if segs[:1] == ["api"] else "page"
         return f"/{'/'.join(segs)} · {role}".replace("// ", "/ ")
     return None
+
+
+# git badge colors follow VS Code's SCM decoration conventions:
+# modified/renamed = yellow, added/untracked = green.
+# Ref: https://code.visualstudio.com/api/references/theme-color#git-colors
+_GIT_STYLE = {"M": "yellow", "A": "green", "?": "green", "R": "yellow"}
+_GIT_WORD = {"M": "modified", "A": "added", "?": "untracked", "R": "renamed"}
 
 
 def _def_label(d: Definition) -> Text:
@@ -283,6 +291,8 @@ class HelpScreen(ModalScreen):
   [yellow]★[/yellow]         bookmarked line · [cyan]A › b[/cyan]   current location
   [green]→ name  path:line[/green]   call that resolves to a project definition
   [dim]→ name[/dim]             call into stdlib / dependencies (unresolved)
+  [yellow]●[/yellow] def with uncommitted changes · [dim yellow]○[/dim yellow] changes inside
+                    (pith -d explores only changed files)
 """
 
     def compose(self) -> ComposeResult:
@@ -382,11 +392,13 @@ class PithApp(App):
     Tree { padding: 0 1; }
     """
 
-    def __init__(self, root: Path, start_file: str | None = None, editor: str | None = None):
+    def __init__(self, root: Path, start_file: str | None = None, editor: str | None = None,
+                 diff_only: bool = False):
         super().__init__()
         self.indexer = Indexer(root)
         self.start_file = start_file
         self.editor = editor
+        self.diff_only = diff_only  # --diff: pickers show only changed files
         self.history: list[tuple[str, int]] = []  # (path, tree cursor line)
         self.current: FileView | None = None
         self.ready = False
@@ -434,6 +446,9 @@ class PithApp(App):
     @work(thread=True, exclusive=True)
     def _index_repo(self) -> None:
         self.indexer.discover_files()
+        # git snapshot before the symbol table so badges exist by the time
+        # _on_indexed opens start_file
+        self.indexer.refresh_git()
         self.indexer.build_symbol_table()
         self.call_from_thread(self._on_indexed)
 
@@ -442,7 +457,10 @@ class PithApp(App):
         self.query_one("#loading").display = False
         self.query_one(Tree).display = True
         n = len(self.indexer.source_files())
-        self._status(f"indexed {n} source files · {len(self.indexer.symbols)} symbols")
+        changed = sum(1 for f in self.indexer.source_files()
+                      if self.indexer.git.is_changed(f))
+        extra = f" · {changed} changed" if changed else ""
+        self._status(f"indexed {n} source files · {len(self.indexer.symbols)} symbols{extra}")
         if self.start_file:
             self.open_file(self.start_file)
         else:
@@ -469,6 +487,8 @@ class PithApp(App):
         crumbs = f"  ·  {len(self.history)} back" if self.history else ""
         t = Text()
         t.append(" pith ", style="bold reverse")
+        if self.diff_only:
+            t.append(" diff ", style="bold reverse yellow")
         t.append(f" {path}", style="bold bright_white")
         if self.needle:
             t.append(f"  🔍 “{self.needle}”", style="yellow")
@@ -568,6 +588,9 @@ class PithApp(App):
         root_label = Text(fv.path)
         if (role := _nextjs_role(fv.path)):
             root_label.append(f"  ▸ {role}", style="dim green")
+        git_code = self.indexer.git.code(fv.path)
+        if git_code and git_code != "D":
+            root_label.append(f"  ● {_GIT_WORD[git_code]}", style=_GIT_STYLE[git_code])
         tree.root.set_label(root_label)
         if fv.error:
             tree.root.add_leaf(Text(fv.error, style="red"),
@@ -602,6 +625,11 @@ class PithApp(App):
         def add_def(parent, d: Definition) -> bool:
             """Add d's subtree pruned to matches; True if anything was kept."""
             label = _def_label(d)
+            mark = self._git_def_mark(fv.path, d)
+            if mark == "direct":
+                label = Text("● ", style=_GIT_STYLE.get(git_code or "M", "yellow")) + label
+            elif mark == "inner":
+                label = Text("○ ", style="dim yellow") + label
             if self._bookmarked(fv.path, d.line):
                 label = Text("★ ", style="yellow") + label
             text = f"{d.name} {d.signature}"
@@ -780,7 +808,16 @@ class PithApp(App):
         if not self.ready:
             return
         files = self.indexer.source_files()
-        items = [(f, f) for f in files]
+        if self.diff_only:
+            changed = [f for f in files if self.indexer.git.is_changed(f)]
+            if changed:
+                files = changed
+            else:
+                self._status("no uncommitted changes — showing all files")
+        # glyph-only suffix so PickScreen's substring filter isn't polluted
+        # by words like "modified"
+        items = [(f + "  ●" if self.indexer.git.is_changed(f) else f, f)
+                 for f in files]
         self.push_screen(PickScreen("open file", items),
                          lambda f: self.open_file(f) if f else None)
 
@@ -810,6 +847,34 @@ class PithApp(App):
 
     def _bookmarked(self, path: str, line: int) -> bool:
         return f"{path}:{line}" in self.bookmarks
+
+    def _git_def_mark(self, rel: str, d: Definition) -> str | None:
+        """Two-tier uncommitted-change mark for a definition.
+
+        "direct" — a changed line hits d's own body (outside every child), so
+        the strong badge points at the innermost def that actually changed.
+        "inner" — changes only inside children; a collapsed container still
+        reveals that something within it changed.  None — untouched.
+        """
+        git = self.indexer.git
+        if not git.touches(rel, d.line, d.end_line):
+            return None
+        kids = sorted((c.line, c.end_line) for c in d.children)
+        for a, b in git.hunks.get(rel, ()):
+            lo, hi = max(a, d.line), min(b, d.end_line)
+            if lo > hi:
+                continue
+            # sweep lo past any child that covers it; children are disjoint
+            # and sorted, so the first child starting beyond lo leaves lo
+            # uncovered — that residue is a change in d's own body
+            for ca, cb in kids:
+                if ca > hi:
+                    break
+                if ca <= lo <= cb:
+                    lo = cb + 1
+            if lo <= hi:
+                return "direct"
+        return "inner"
 
     def _re_render_keep_cursor(self) -> None:
         """Re-render the current file, then restore the cursor to its node."""
@@ -864,7 +929,11 @@ class PithApp(App):
         if not self.ready:
             return
         items: list[tuple[str, Location]] = []
+        restrict = self.diff_only and any(
+            self.indexer.git.is_changed(f) for f in self.indexer.source_files())
         for name, locs in self.indexer.symbols.items():
+            if restrict:
+                locs = [l for l in locs if self.indexer.git.is_changed(l.path)]
             for loc in locs[:5]:
                 items.append((f"{name}  {loc.path}:{loc.line}  ({loc.kind})", loc))
             if len(items) >= 3000:
@@ -986,6 +1055,9 @@ class PithApp(App):
 
     def action_reload(self) -> None:
         if self.current:
+            # synchronous git re-snapshot: two subprocesses with a 5 s cap —
+            # acceptable on an explicit r press, keeps badges honest
+            self.indexer.refresh_git()
             self.open_file(self.current.path, push=False)
 
     def action_help(self) -> None:
@@ -1052,6 +1124,7 @@ class PithApp(App):
         rel pick up the change; self.refresh() alone only repaints the
         existing (now possibly stale) tree.
         """
+        self.indexer.refresh_git()
         self.indexer.reindex_file(rel)
         if self.current is not None:
             tree = self.query_one(Tree)
@@ -1157,12 +1230,17 @@ class PithApp(App):
         self.call_from_thread(self._status, msg)
 
 
-def _fzf_pick_file(root: Path) -> str | None:
+def _fzf_pick_file(root: Path, git: GitState | None = None) -> str | None:
     """Pick a source file with fzf before pith boots (fast external picker).
 
     Returns the repo-relative path of the selection, or None when fzf is not
     installed, stdin/stdout aren't a terminal, the user cancelled, or there
     are no source files — in which case pith falls back to its in-app picker.
+
+    With *git* (the --diff path) the list is restricted to changed files;
+    changed files always get a colored ● glyph after a tab, kept out of
+    fuzzy matching via --delimiter/--nth so only the filename is searched.
+    Ref: https://man.archlinux.org/man/fzf.1#nth
     """
     if not sys.stdin.isatty() or not sys.stdout.isatty():
         return None
@@ -1171,20 +1249,33 @@ def _fzf_pick_file(root: Path) -> str | None:
         return None
     indexer = Indexer(root)
     indexer.discover_files()
+    if git is None:
+        indexer.refresh_git()  # badge glyphs are shown in normal mode too
+    state = git if git is not None else indexer.git
     files = indexer.source_files()
+    if git is not None:
+        files = [f for f in files if git.is_changed(f)]
     if not files:
         return None
+    # SGR color per git code: modified/renamed yellow (33), added/untracked
+    # green (32).  Ref: https://en.wikipedia.org/wiki/ANSI_escape_code#SGR
+    _sgr = {"M": "33", "R": "33", "A": "32", "?": "32"}
+    lines = [f + (f"\t\x1b[{_sgr[c]}m●\x1b[0m" if (c := state.code(f)) in _sgr else "")
+             for f in files]
+    header = ("changed files — enter opens it in pith (esc = pith's own picker)"
+              if git is not None else
+              "pick a file — enter opens it in pith (esc = pith's own picker)")
     try:
         proc = subprocess.run(
-            ["fzf", "--height", "40%", "--border",
-             "--header", "pick a file — enter opens it in pith (esc = pith's own picker)"],
-            input="\n".join(files) + "\n",
+            ["fzf", "--height", "40%", "--border", "--ansi",
+             "--delimiter", "\t", "--nth", "1", "--header", header],
+            input="\n".join(lines) + "\n",
             capture_output=True, text=True,
         )
     except (OSError, ValueError):
         return None
     sel = proc.stdout.strip()
-    return sel or None
+    return sel.split("\t", 1)[0] if sel else None
 
 
 def find_root(start: Path) -> Path:
@@ -1255,20 +1346,34 @@ config — custom keybindings:
     ap.add_argument("--editor", help="editor command (default: $EDITOR)")
     ap.add_argument("--no-fzf", action="store_true",
                     help="skip the fzf file picker and use pith's in-app picker")
+    ap.add_argument("-d", "--diff", action="store_true",
+                    help="explore only files with uncommitted changes "
+                         "(working tree + staged vs HEAD)")
     args = ap.parse_args(argv)
 
     target = Path(args.path).expanduser()
     if not target.exists():
         raise SystemExit(f"pith: no such path: {target}")
     root = find_root(target)
+
+    git_state = None
+    if args.diff:
+        git_state = collect_git(root)
+        if not git_state.available:
+            raise SystemExit("pith: --diff requires a git repository")
+        if not any(git_state.is_changed(f) and _lang_for(f) for f in git_state.codes):
+            raise SystemExit("pith: --diff: no uncommitted changes in source files")
+
     start_file = None
     if target.is_file():
+        # an explicit file argument bypasses the --diff filter deliberately
         start_file = os.path.relpath(target.resolve(), root)
     elif not args.no_fzf:
         # pick the file with fzf (instant) before the slower Textual boot
-        start_file = _fzf_pick_file(root)
+        start_file = _fzf_pick_file(root, git=git_state)
 
-    PithApp(root, start_file=start_file, editor=args.editor).run()
+    PithApp(root, start_file=start_file, editor=args.editor,
+            diff_only=args.diff).run()
 
 
 if __name__ == "__main__":

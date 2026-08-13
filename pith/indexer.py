@@ -22,6 +22,8 @@ from grep_ast import filename_to_lang
 from grep_ast.tsl import get_language, get_parser
 from tree_sitter import Query, QueryCursor
 
+from .gitstate import GitState, collect as collect_git
+
 QUERY_DIR = Path(__file__).parent / "queries"
 
 MAX_FILE_BYTES = 400_000
@@ -298,6 +300,8 @@ class Indexer:
         self.files: list[str] = []
         self._file_set: set[str] = set()
         self._ts_base_url, self._ts_paths = _load_ts_aliases(self.root)
+        # uncommitted-change snapshot; empty (available=False) until refreshed
+        self.git: GitState = GitState()
 
     # -- repo walking -------------------------------------------------------
 
@@ -324,6 +328,10 @@ class Indexer:
         self.files = files
         self._file_set = set(files)
         return files
+
+    def refresh_git(self) -> None:
+        """Re-snapshot uncommitted changes (badges + --diff filtering)."""
+        self.git = collect_git(self.root)
 
     def source_files(self) -> list[str]:
         return [f for f in self.files if _lang_for(f)]

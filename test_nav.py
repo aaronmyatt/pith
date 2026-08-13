@@ -724,6 +724,163 @@ async def _markdown_render():
 test_markdown_render()
 
 
+def _git(root, *args):
+    """Run git in the fixture repo, isolated from the user's config."""
+    import subprocess
+    env = {**os.environ, "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_CONFIG_SYSTEM": "/dev/null"}
+    subprocess.run(["git", "-c", "user.email=t@t", "-c", "user.name=t",
+                    "-c", "init.defaultBranch=main", *args],
+                   cwd=root, env=env, check=True, capture_output=True)
+
+
+def _make_git_fixture(root: Path) -> None:
+    """Committed a/b/c, then: unstaged edit in paint, staged new file,
+    untracked new file, rename of c.py."""
+    (root / "a.py").write_text(A)
+    (root / "b.py").write_text(B)
+    (root / "c.py").write_text(C)
+    _git(root, "init")
+    _git(root, "add", "-A")
+    _git(root, "commit", "-m", "base")
+    (root / "a.py").write_text(A.replace('render("dark")', 'render("light")'))
+    (root / "staged.py").write_text("def staged_fn():\n    return 2\n")
+    _git(root, "add", "staged.py")
+    (root / "new.py").write_text("def fresh():\n    return 1\n")
+    _git(root, "mv", "c.py", "c2.py")
+
+
+def test_gitstate():
+    """collect(): codes, hunk intervals, untracked whole-file, no-HEAD, non-repo."""
+    from pith.gitstate import collect, WHOLE_FILE
+
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        _make_git_fixture(root)
+        s = collect(root)
+        assert s.available
+        assert s.codes == {"a.py": "M", "staged.py": "A", "new.py": "?", "c2.py": "R"}, s.codes
+        # the unstaged edit is on line 11 (inside Renderer.paint)
+        assert s.touches("a.py", 11, 11) and not s.touches("a.py", 3, 5), s.hunks
+        assert s.hunks["new.py"] == [(1, WHOLE_FILE)]
+        assert s.is_changed("staged.py") and not s.is_changed("missing.py")
+
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        (root / "t.py").write_text("x = 1\n")
+        _git(root, "init")
+        _git(root, "add", "t.py")
+        s = collect(root)  # staged file but no commit yet -> no HEAD to diff
+        assert s.available and s.hunks["t.py"] == [(1, WHOLE_FILE)], s.hunks
+
+    with tempfile.TemporaryDirectory() as td:
+        s = collect(Path(td))  # not a repo
+        assert not s.available and not s.codes
+
+
+test_gitstate()
+
+
+def test_git_badges():
+    asyncio.run(_git_badges())
+
+
+async def _git_badges():
+    def _node(parent, name):
+        return next(n for n in parent.children
+                    if isinstance(n.data, dict) and n.data.get("name") == name)
+
+    with tempfile.TemporaryDirectory() as td:
+        os.environ["XDG_CONFIG_HOME"] = td
+        root = Path(td)
+        _make_git_fixture(root)
+
+        app = PithApp(root, start_file="a.py")
+        async with app.run_test() as pilot:
+            for _ in range(300):
+                if app.ready:
+                    break
+                await pilot.pause(0.05)
+            assert app.ready
+            t = app.query_one(Tree)
+            assert "● modified" in t.root.label.plain, t.root.label.plain
+            renderer = _node(t.root, "Renderer")
+            paint = _node(renderer, "paint")
+            render = _node(t.root, "render")
+            assert paint.label.plain.startswith("● "), "edited method gets the direct mark"
+            assert renderer.label.plain.startswith("○ "), "container gets the inner mark"
+            assert not render.label.plain.startswith(("● ", "○ ")), "untouched def stays clean"
+
+            # staged-only change is still badged (diff runs against HEAD)
+            app.open_file("staged.py")
+            await pilot.pause()
+            assert "● added" in t.root.label.plain
+            assert _node(t.root, "staged_fn").label.plain.startswith("● ")
+
+            # untracked file: whole file is new, every def marked
+            app.open_file("new.py")
+            await pilot.pause()
+            assert "● untracked" in t.root.label.plain
+            assert _node(t.root, "fresh").label.plain.startswith("● ")
+
+            # unchanged file: no badges anywhere
+            app.open_file("b.py")
+            await pilot.pause()
+            assert "●" not in t.root.label.plain
+            assert not _node(t.root, "parse").label.plain.startswith(("● ", "○ "))
+    print("git badges OK")
+
+
+test_git_badges()
+
+
+def test_diff_only():
+    asyncio.run(_diff_only())
+
+
+async def _diff_only():
+    changed = {"a.py", "staged.py", "new.py", "c2.py"}
+    with tempfile.TemporaryDirectory() as td:
+        os.environ["XDG_CONFIG_HOME"] = td
+        root = Path(td)
+        _make_git_fixture(root)
+
+        app = PithApp(root, start_file="a.py", diff_only=True)
+        async with app.run_test() as pilot:
+            for _ in range(300):
+                if app.ready:
+                    break
+                await pilot.pause(0.05)
+            assert app.ready
+            t = app.query_one(Tree)
+
+            app.action_pick_file()
+            await pilot.pause()
+            assert isinstance(app.screen, PickScreen)
+            picked = {v for _, v in app.screen.items}
+            assert picked == changed, picked
+            await pilot.press("escape"); await pilot.pause()
+
+            app.action_jump_symbol()
+            await pilot.pause()
+            assert isinstance(app.screen, PickScreen)
+            sym_paths = {loc.path for _, loc in app.screen.items}
+            assert sym_paths <= changed, sym_paths
+            assert "b.py" not in sym_paths
+            await pilot.press("escape"); await pilot.pause()
+
+            # navigation OUT of the diff stays unrestricted: follow the
+            # b.parse ref from a.py into unchanged b.py, then back
+            app.open_file("b.py")
+            await pilot.pause()
+            assert app.current.path == "b.py"
+            await pilot.press("b"); await pilot.pause()
+            assert app.current.path == "a.py"
+    print("diff only OK")
+
+
+test_diff_only()
+
+
 def test_html():
     """HTML outline: semantic + id'd elements nest like the DOM, div soup skipped."""
     from pith.indexer import Indexer, _lang_for, STRUCTURAL_LANGS
