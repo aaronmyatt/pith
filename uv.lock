@@ -80,6 +80,7 @@ version = "0.4.0"
 source = { editable = "." }
 dependencies = [
     { name = "grep-ast" },
+    { name = "rich" },
     { name = "textual" },
     { name = "tree-sitter" },
     { name = "tree-sitter-language-pack" },
@@ -88,6 +89,7 @@ dependencies = [
 [package.metadata]
 requires-dist = [
     { name = "grep-ast", specifier = ">=0.5" },
+    { name = "rich", specifier = ">=13" },
     { name = "textual", specifier = ">=0.80" },
     { name = "tree-sitter", specifier = ">=0.25,<0.26" },
     { name = "tree-sitter-language-pack", specifier = ">=1.10" },

@@ -26,7 +26,6 @@ import subprocess
 import sys
 from pathlib import Path
 
-from rich.syntax import Syntax
 from rich.text import Text
 from textual import events, work
 from textual.app import App, ComposeResult
@@ -39,148 +38,21 @@ from textual.widgets.option_list import Option
 from .config import UserCommand, load_user_commands
 from .gitstate import GitState, collect as collect_git
 from .indexer import Definition, FileView, Indexer, Location, _lang_for
-
-KIND_ICON = {
-    "class": ("◆", "bright_magenta"),
-    "interface": ("◇", "bright_magenta"),
-    "function": ("ƒ", "bright_cyan"),
-    "method": ("ƒ", "cyan"),
-    "constant": ("π", "yellow"),
-    "module": ("▤", "blue"),
-    "type": ("τ", "bright_magenta"),
-    "enum": ("∷", "yellow"),
-    "key": ("∙", "grey70"),
-    "table": ("▥", "bright_blue"),
-    "section": ("§", "green"),
-}
-
-MAX_DOC_LINES = 14
-MAX_DOC_LINE_CHARS = 100  # doc lines longer than this collapse; drill in to read the rest
-
-# Next.js App Router special files and what they contribute to a route segment.
-# Ref: https://nextjs.org/docs/app/api-reference/file-conventions
-_NEXT_SPECIAL = {
-    "page": "page", "layout": "layout", "route": "API route",
-    "loading": "loading UI", "error": "error UI", "global-error": "global error UI",
-    "not-found": "not-found UI", "template": "template",
-    "default": "parallel-route fallback",
-}
-_NEXT_EXTS = {".ts", ".tsx", ".js", ".jsx", ".mjs"}
-
-
-def _nextjs_role(path: str) -> str | None:
-    """Route annotation ("/dashboard · page") for Next.js convention files.
-
-    Route groups "(group)", parallel slots "@slot" and private "_folders" are
-    dropped from the displayed route, matching how Next.js maps URLs; dynamic
-    "[param]" segments are kept verbatim.
-    Ref: https://nextjs.org/docs/app/api-reference/file-conventions/dynamic-routes
-    """
-    p = Path(path)
-    if p.suffix not in _NEXT_EXTS:
-        return None
-    parts = p.parts
-    in_src = len(parts) > 1 and parts[0] == "src"
-    if p.stem in ("middleware", "instrumentation") and len(parts) == (2 if in_src else 1):
-        return p.stem
-    for router in ("app", "pages"):
-        if router not in parts:
-            continue
-        i = parts.index(router)
-        if i != (1 if in_src else 0):
-            continue
-        segs = [s for s in parts[i + 1:-1]
-                if not (s.startswith("(") or s.startswith("@") or s.startswith("_"))]
-        if router == "app":
-            role = _NEXT_SPECIAL.get(p.stem)
-            if role is None:
-                return None
-            return f"/{'/'.join(segs)} · {role}"
-        # Pages Router. Ref: https://nextjs.org/docs/pages/building-your-application/routing
-        if p.stem in ("_app", "_document", "_error"):
-            return f"custom {p.stem.lstrip('_')}"
-        if p.stem != "index":
-            segs.append(p.stem)
-        role = "API route" if segs[:1] == ["api"] else "page"
-        return f"/{'/'.join(segs)} · {role}".replace("// ", "/ ")
-    return None
-
-
-# git badge colors follow VS Code's SCM decoration conventions:
-# modified/renamed = yellow, added/untracked = green.
-# Ref: https://code.visualstudio.com/api/references/theme-color#git-colors
-_GIT_STYLE = {"M": "yellow", "A": "green", "?": "green", "R": "yellow"}
-_GIT_WORD = {"M": "modified", "A": "added", "?": "untracked", "R": "renamed"}
-
-
-def _def_label(d: Definition) -> Text:
-    icon, color = KIND_ICON.get(d.kind, ("•", "white"))
-    t = Text()
-    t.append(f"{icon} ", style=color)
-    sig = d.signature or d.name
-    idx = sig.find(d.name)
-    if idx >= 0:
-        t.append(sig[:idx], style="bright_white")
-        t.append(d.name, style=f"bold {color}")
-        t.append(sig[idx + len(d.name):], style="bright_white")
-    else:
-        t.append(sig, style="bright_white")
-    t.append(f"  :{d.line}", style="dim")
-    if d.docstring:
-        first = d.docstring.splitlines()[0]
-        t.append(f"  {first[:70]}", style="italic dim")
-    return t
-
-
-def _ref_label(name: str, targets: list[Location]) -> Text:
-    t = Text()
-    if targets:
-        loc = targets[0]
-        t.append("→ ", style="green")
-        t.append(name, style="green")
-        t.append(f"  {loc.path}:{loc.line}", style="dim")
-        if len(targets) > 1:
-            t.append(f"  (+{len(targets) - 1} more)", style="dim yellow")
-    else:
-        t.append("→ ", style="dim")
-        t.append(name, style="dim")
-    return t
-
-
-def _search_text(name: str, targets: list[Location]) -> str:
-    """Searchable text for a reference: name + resolved target path:line."""
-    t = name
-    if targets:
-        t += f" {targets[0].path}:{targets[0].line}"
-        if len(targets) > 1:
-            t += f" (+{len(targets) - 1} more)"
-    return t
-
-
-_DOC_STYLE = "italic #8a8a8a"
-_md_syntax: Syntax | None = None
-
-
-def _doc_text(s: str, lang: str | None) -> Text:
-    """Style one line of a definition's doc/comment body.
-
-    Markdown section bodies are prose, not comments — highlight them with
-    real markdown syntax colouring (headings/bold/code/links) instead of the
-    plain dim-italic look every other language's docstrings/comments get.
-    Ref: https://rich.readthedocs.io/en/stable/syntax.html
-    """
-    if lang == "markdown" and s.strip():
-        global _md_syntax
-        if _md_syntax is None:
-            _md_syntax = Syntax("", "markdown", theme="ansi_dark", background_color="default")
-        try:
-            t = _md_syntax.highlight(s)
-            if t.plain.endswith("\n"):
-                t = t[: len(t) - 1]
-            return t
-        except Exception:
-            pass
-    return Text(s, style=_DOC_STYLE)
+# Shared skeleton styling lives in printer so `pith --print` renders the same
+# labels without a Textual dependency; the TUI is just another consumer.
+from .printer import (
+    _DOC_STYLE,
+    _GIT_STYLE,
+    _GIT_WORD,
+    MAX_DOC_LINE_CHARS,
+    MAX_DOC_LINES,
+    _def_label,
+    _doc_text,
+    _nextjs_role,
+    _ref_label,
+    _search_text,
+    git_def_mark,
+)
 
 
 class PickScreen(ModalScreen):
@@ -625,7 +497,7 @@ class PithApp(App):
         def add_def(parent, d: Definition) -> bool:
             """Add d's subtree pruned to matches; True if anything was kept."""
             label = _def_label(d)
-            mark = self._git_def_mark(fv.path, d)
+            mark = git_def_mark(self.indexer.git, fv.path, d)
             if mark == "direct":
                 label = Text("● ", style=_GIT_STYLE.get(git_code or "M", "yellow")) + label
             elif mark == "inner":
@@ -847,34 +719,6 @@ class PithApp(App):
 
     def _bookmarked(self, path: str, line: int) -> bool:
         return f"{path}:{line}" in self.bookmarks
-
-    def _git_def_mark(self, rel: str, d: Definition) -> str | None:
-        """Two-tier uncommitted-change mark for a definition.
-
-        "direct" — a changed line hits d's own body (outside every child), so
-        the strong badge points at the innermost def that actually changed.
-        "inner" — changes only inside children; a collapsed container still
-        reveals that something within it changed.  None — untouched.
-        """
-        git = self.indexer.git
-        if not git.touches(rel, d.line, d.end_line):
-            return None
-        kids = sorted((c.line, c.end_line) for c in d.children)
-        for a, b in git.hunks.get(rel, ()):
-            lo, hi = max(a, d.line), min(b, d.end_line)
-            if lo > hi:
-                continue
-            # sweep lo past any child that covers it; children are disjoint
-            # and sorted, so the first child starting beyond lo leaves lo
-            # uncovered — that residue is a change in d's own body
-            for ca, cb in kids:
-                if ca > hi:
-                    break
-                if ca <= lo <= cb:
-                    lo = cb + 1
-            if lo <= hi:
-                return "direct"
-        return "inner"
 
     def _re_render_keep_cursor(self) -> None:
         """Re-render the current file, then restore the cursor to its node."""
@@ -1346,6 +1190,13 @@ config — custom keybindings:
     ap.add_argument("--editor", help="editor command (default: $EDITOR)")
     ap.add_argument("--no-fzf", action="store_true",
                     help="skip the fzf file picker and use pith's in-app picker")
+    ap.add_argument("-p", "--print", dest="print_tree", action="store_true",
+                    help="print a static skeleton tree to stdout and exit (no TUI); "
+                         "a file argument prints that file, a directory prints every "
+                         "source file — pipe- and embed-friendly")
+    # both spellings so muscle memory from either side of the Atlantic works
+    ap.add_argument("--no-colour", "--no-color", dest="no_colour", action="store_true",
+                    help="with --print: plain text output, no ANSI styling")
     ap.add_argument("-d", "--diff", action="store_true",
                     help="explore only files with uncommitted changes "
                          "(working tree + staged vs HEAD)")
@@ -1363,6 +1214,12 @@ config — custom keybindings:
             raise SystemExit("pith: --diff requires a git repository")
         if not any(git_state.is_changed(f) and _lang_for(f) for f in git_state.codes):
             raise SystemExit("pith: --diff: no uncommitted changes in source files")
+
+    if args.print_tree:
+        from .printer import print_skeletons
+        files = [os.path.relpath(target.resolve(), root)] if target.is_file() else None
+        raise SystemExit(print_skeletons(root, files, no_colour=args.no_colour,
+                                         diff_only=args.diff))
 
     start_file = None
     if target.is_file():

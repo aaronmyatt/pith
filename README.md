@@ -27,6 +27,9 @@ pith                 # pick a file with fzf (instant), then open it
 pith src/engine.py   # open one file directly (repo root auto-detected via .git)
 pith ~/code/myrepo   # index a specific repo
 pith --no-fzf        # skip fzf; use pith's built-in picker
+pith -p src/x.py     # print that file's static skeleton to stdout (no TUI);
+                     # rich colours survive pipes — add --no-colour for plain text
+pith -p              # print every source file's skeleton (-d: only changed files)
 
 When `fzf` is installed, `pith` (and `pith <dir>`) start with fzf over the
 repo's source files — fzf launches in milliseconds, so you pick the file
